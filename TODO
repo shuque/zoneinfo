@@ -1,0 +1,8 @@
+ToDo list
+
+* Perform DNSSEC validation (using preconfigured root key)
+* Provide option to explicitly set source address of queries
+* For 'plain' UDP queries, if truncated response, retry with TCP
+* Do more detailed exception handling
+* Check open-recursion status
+* On dns.exception.timeout, retry (a few times)?

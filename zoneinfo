@@ -1,0 +1,383 @@
+#!/usr/bin/env python
+#
+
+"""\
+Module to print some information about a DNS zone. This code
+is part of a larger program that collects and displays zone
+information in a web application for a large set of zones.
+
+Author: Shumon Huque <shuque@upenn.edu>
+
+"""
+
+import sys
+import socket
+import dns.resolver, dns.message, dns.query, dns.rdatatype, dns.rcode
+import dns.dnssec
+from datetime import datetime
+import time
+
+DEBUG = False                            # set to True by "-d"
+TIMEOUT = 5
+
+class NameServer:
+    def __init__(self, name):
+        self.name = name                 # nameserver name
+        self.ip4 = []                    # list of IPv4 addresses
+        self.ip6 = []                    # list of IPv6 addresses
+
+
+class ZoneInfoError(Exception):
+    pass
+
+class ZoneInfo:
+    def __init__(self, name):
+        self.zone = name
+        self.check_date = None           # a python datetime object
+        self.check_duration = None       # time (secs) taken for check of zone
+        self.nameservers = []            # list of NameServer objects
+        self.ns_count_all = 0            # num of NS names (records)
+        self.ns_count_ip4 = 0            # num of NS names with ipv4
+        self.ns_count_ip6 = 0            # num of NS names with ipv6
+        self.nsaddr_count_all = 0        # num of server addresses in total
+        self.nsaddr_success_udp = 0      # num of servers responding to UDP
+        self.nsaddr_success_tcp = 0      # num of servers responding to TCP
+        self.nsaddr_count_ip4 = 0        # num of server IPv4 addresses
+        self.nsaddr_count_ip6 = 0        # num of server IPv6 addresses
+        self.nsaddr_success_ip4 = 0
+        self.nsaddr_success_ip6 = 0
+        self.has_ip6 = False
+        self.has_tcp = False
+        self.has_dnssec = False
+        self.has_nsec3 = False
+        self.has_ds = False
+        self.dnssec_alg_ksk = []         # list of (keytag, keyalg)
+        self.dnssec_alg_zsk = []         # list of (keytag, keyalg)
+        self.nsec3param = []             # list of nsec3param tuples: 
+                                         # (hashalg, flags, iter, saltlen)
+        self.ds_digest_alg = []          # list of (keytag, dsalg)
+        self.debug_info = []
+        self.print_debug = DEBUG
+        return
+    def dprint(self, data):
+        self.debug_info.append(data)
+        if self.print_debug:
+            print >>sys.stderr, "%s" % data
+        return
+    def get_debug_info(self):
+        return "\n".join(self.debug_info)
+
+
+def check_valid_zone(zone, zoneinfo):
+    """Is the domain name an actual zone, eg. has a SOA record at apex"""
+    r = dns.resolver.Resolver()
+    r.lifetime = TIMEOUT
+    try:
+        answers = r.query(zone, 'SOA')
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+        (exc_type, exc_value, exc_traceback) = sys.exc_info()
+        errmsg = "%s: not a zone. %s, %s" % (zone, exc_type, exc_value)
+        zoneinfo.dprint(errmsg)
+        raise ZoneInfoError, errmsg
+    except (dns.exception.Timeout):
+        (exc_type, exc_value, exc_traceback) = sys.exc_info()
+        errmsg = "%s: SOA query timed out. %s, %s" % \
+            (zone, exc_type, exc_value)
+        zoneinfo.dprint(errmsg)
+        raise ZoneInfoError, errmsg
+    else:
+        return
+
+
+def get_nameservers(zone, zoneinfo):
+    """get all nameserver names and addresses for the zone"""
+    try:
+        r = dns.resolver.Resolver()
+        r.lifetime = TIMEOUT
+        answers = r.query(zone, 'NS')
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
+            dns.resolver.NoNameservers):
+        zoneinfo.dprint("%s: unamed to find any nameservers\n" % zone)
+        return
+    except (dns.exception.Timeout):
+        (exc_type, exc_value, exc_traceback) = sys.exc_info()
+        errmsg = "%s: NS query timed out. %s, %s" % (zone, exc_type, exc_value)
+        zoneinfo.dprint(errmsg)
+        return
+
+    for nsname in answers.rrset:
+        zoneinfo.ns_count_all += 1
+        nshostname = str(nsname.target)
+        zoneinfo.dprint("Found nameserver: %s" % nshostname)
+        nsobj = NameServer(nshostname)
+        try:
+            ai_list = socket.getaddrinfo(nshostname, 53, socket.AF_UNSPEC, 
+                                         socket.SOCK_DGRAM)
+        except socket.gaierror, diag:
+            zoneinfo.dprint("getaddrinfo: %s failed: %s" % (nshostname, diag))
+            continue
+
+        seen_ip4 = seen_ip6 = False
+        for (family, socktype, proto, canon, sockaddr) in ai_list:
+            zoneinfo.nsaddr_count_all += 1
+            if family == socket.AF_INET:
+                seen_ip4 = True
+                zoneinfo.nsaddr_count_ip4 += 1
+                nsobj.ip4.append(sockaddr[0])
+                zoneinfo.dprint("\tFound IPv4 address: %s" % sockaddr[0])
+            elif family == socket.AF_INET6:
+                seen_ip6 = True
+                zoneinfo.nsaddr_count_ip6 += 1
+                nsobj.ip6.append(sockaddr[0])
+                zoneinfo.dprint("\tFound IPv6 address: %s" % sockaddr[0])
+        if seen_ip4: zoneinfo.ns_count_ip4 += 1
+        if seen_ip6: zoneinfo.ns_count_ip6 += 1
+        zoneinfo.nameservers.append(nsobj)
+
+    if zoneinfo.ns_count_ip6 > 0:
+        zoneinfo.has_ip6 = True
+
+    zoneinfo.dprint("NS records %d, IP4 %d, IP6 %d" %
+                    (zoneinfo.ns_count_all, zoneinfo.ns_count_ip4,
+                     zoneinfo.ns_count_ip6))
+    return
+
+
+def check_ip6_dns(zone, zoneinfo):
+    """Check zone has IPv6 DNS servers advertised for every NS"""
+    for nsobj in zoneinfo.nameservers:
+        if len(nsobj.ip6) == 0:
+            zoneinfo.dprint("NS: %s has no IPv6 address record" % nsobj.name)
+    return
+
+
+def check_udp_dns(zone, zoneinfo):
+    """Check DNS over UDP to zone nameservers"""
+    udp_failed = []
+    for nsobj in zoneinfo.nameservers:
+        nshostname = nsobj.name
+        for ip in nsobj.ip4 + nsobj.ip6:
+            zoneinfo.dprint("Trying DNS/UDP query to %s, %s" % 
+                            (nshostname, ip))
+            msg = dns.message.make_query(zone, 'SOA')
+            msg.flags ^= dns.flags.RD
+            try:
+                response = dns.query.udp(msg, ip, timeout=TIMEOUT)
+            except Exception, diag:
+                zoneinfo.dprint("DNS/UDP failed: %s, %s" % (nsobj.name, ip))
+                udp_failed.append( (nshostname, ip) )
+            else:
+                zoneinfo.nsaddr_success_udp += 1
+                if ip in nsobj.ip4:
+                    zoneinfo.nsaddr_success_ip4 +=1
+                elif ip in nsobj.ip6:
+                    zoneinfo.nsaddr_success_ip6 +=1
+
+    zoneinfo.dprint("DNS/UDP success: %d of %d servers" % 
+                    (zoneinfo.nsaddr_success_udp, zoneinfo.nsaddr_count_all))
+    return
+
+
+def check_tcp_dns(zone, zoneinfo):
+    """Check DNS over TCP to zone nameservers"""
+    for nsobj in zoneinfo.nameservers:
+        nshostname = nsobj.name
+        for ip in nsobj.ip4 + nsobj.ip6:
+            zoneinfo.dprint("Trying DNS/TCP query to %s, %s" % 
+                            (nshostname, ip))
+            msg = dns.message.make_query(zone, 'SOA')
+            msg.flags ^= dns.flags.RD
+            try:
+                response = dns.query.tcp(msg, ip, timeout=TIMEOUT)
+            except:
+                zoneinfo.dprint("DNS/TCP failed: %s, %s" % (nsobj.name, ip))
+            else:
+                zoneinfo.nsaddr_success_tcp += 1
+
+    if zoneinfo.nsaddr_success_tcp == zoneinfo.nsaddr_count_all:
+       zoneinfo.has_tcp = True
+
+    zoneinfo.dprint("DNS/TCP success: %d of %d servers" % 
+                    (zoneinfo.nsaddr_success_tcp, zoneinfo.nsaddr_count_all))
+    return
+
+
+def check_dnskey(zone, zoneinfo):
+    """Check any DNSKEY records in the zone"""
+    r = dns.resolver.Resolver()
+    r.lifetime = TIMEOUT
+    r.use_edns(edns=0, ednsflags=0, payload=4096)
+    try:
+        res = r.query(zone, 'DNSKEY')
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
+            dns.resolver.NoNameservers):
+        pass
+    except (dns.exception.Timeout):
+        (exc_type, exc_value, exc_traceback) = sys.exc_info()
+        errmsg = "%s: DNSKEY query timed out. %s, %s" % \
+            (zone, exc_type, exc_value)
+        zoneinfo.dprint(errmsg)
+    else:
+        zoneinfo.has_dnssec = True
+        for dnskey_rdata in res.rrset.items:
+            keytag = dns.dnssec.key_id(dnskey_rdata)
+            dnssec_flags = dnskey_rdata.flags
+            sepkey = dnssec_flags & 0x1;
+            dnssec_alg = dnskey_rdata.algorithm
+            zoneinfo.dprint("DNSSEC key id=%d with flags=%d alg=%d" %
+                            (keytag, dnssec_flags, dnssec_alg))
+            if sepkey:
+                zoneinfo.dnssec_alg_ksk.append((keytag, dnssec_alg))
+            else:
+                zoneinfo.dnssec_alg_zsk.append((keytag, dnssec_alg))
+    return
+
+
+def check_nsec3param(zone, zoneinfo):
+    """Check for NSEC3 zone parameters"""
+    r = dns.resolver.Resolver()
+    r.lifetime = TIMEOUT
+    r.use_edns(edns=0, ednsflags=0, payload=4096)
+    try:
+        res = r.query(zone, 'NSEC3PARAM')
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, 
+            dns.resolver.NoNameservers):
+        pass
+    except (dns.exception.Timeout):
+        (exc_type, exc_value, exc_traceback) = sys.exc_info()
+        errmsg = "%s: NSEC3PARAM query timed out. %s, %s" % \
+            (zone, exc_type, exc_value)
+        zoneinfo.dprint(errmsg)
+    else:
+        zoneinfo.has_nsec3 = True
+        zoneinfo.dprint("Zone has NSEC3PARAM record")
+        for nsec3param in res.rrset.items:
+            alg = nsec3param.algorithm
+            flags = nsec3param.flags
+            iterations = nsec3param.iterations
+            saltlen = len(nsec3param.salt)
+            zoneinfo.nsec3param.append((alg, flags, iterations, saltlen))
+            zoneinfo.dprint(nsec3param.to_text())
+    return
+
+
+def check_ds(zone, zoneinfo):
+    """Check any DS records exist for the zone"""
+    r = dns.resolver.Resolver()
+    r.lifetime = TIMEOUT
+    r.use_edns(edns=0, ednsflags=0, payload=4096)
+    try:
+        res = r.query(zone, 'DS')
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
+            dns.resolver.NoNameservers):
+        pass
+    except (dns.exception.Timeout):
+        (exc_type, exc_value, exc_traceback) = sys.exc_info()
+        errmsg = "%s: DS query timed out. %s, %s" % (zone, exc_type, exc_value)
+        zoneinfo.dprint(errmsg)
+    else:
+        zoneinfo.has_ds = True
+        zoneinfo.dprint("Zone has DS records")
+        for ds in res.rrset.items:
+            zoneinfo.dprint(ds.to_text())
+            zoneinfo.ds_digest_alg.append((ds.key_tag, ds.digest_type))
+    return
+
+
+def results(zoneinfo):
+    if zoneinfo.print_debug:
+        print
+    print "DNS Zone: %s" % zoneinfo.zone
+    print "Elapsed time for zone check: %.2f sec" % zoneinfo.check_duration
+    print "%d Nameserver records" % zoneinfo.ns_count_all
+    print "%d Nameserver addresses (IPv4=%d, IPv6=%d)" % \
+        (zoneinfo.nsaddr_count_all, zoneinfo.nsaddr_count_ip4,
+         zoneinfo.nsaddr_count_ip6)
+    print "DNS/UDP response: %d of %d servers" % \
+        (zoneinfo.nsaddr_success_udp, zoneinfo.nsaddr_count_all)
+    print "DNS/TCP response: %d of %d servers" % \
+        (zoneinfo.nsaddr_success_tcp, zoneinfo.nsaddr_count_all)
+    print "DNS/IPv4 response: %d of %d servers" % \
+        (zoneinfo.nsaddr_success_ip4, zoneinfo.nsaddr_count_ip4)
+    print "DNS/IPv6 response: %d of %d servers" % \
+        (zoneinfo.nsaddr_success_ip6, zoneinfo.nsaddr_count_ip6)
+    if zoneinfo.has_tcp:
+        print "All servers for zone respond to TCP DNS queries"
+    else:
+        print "All servers for zone don't respond to TCP DNS queries"
+    if zoneinfo.has_ip6:
+        print "Zone advertises IPv6 enabled DNS servers"
+    else:
+        print "Zone does not advertise IPv6 enabled DNS servers"
+    if zoneinfo.has_dnssec:
+        print "Zone has DNSSEC enabled"
+        print "\tKSK keytags and algorithms: %s" % \
+            ','.join([str(x) for x in zoneinfo.dnssec_alg_ksk])
+        print "\tZSK keytags and algorithms: %s" % \
+            ','.join([str(x) for x in zoneinfo.dnssec_alg_zsk])
+    else:
+        print "Zone does not have DNSSEC enabled"
+    if zoneinfo.nsec3param:
+        print "Zone uses NSEC3 DNSSEC:"
+        for x in zoneinfo.nsec3param:
+            print "\thash algorithm=%d, flags=%d, iter=%d, saltlen=%d" % x
+    if zoneinfo.has_ds:
+        print "Zone has published DS (Delegation Signer) records:"
+        print "\tDS digest keytags and algorithms: %s" % \
+            ','.join([str(x) for x in zoneinfo.ds_digest_alg])
+    return
+
+
+def get_zoneinfo(zone):
+    """get zone information"""
+
+    zoneinfo = ZoneInfo(zone)
+    t1 = time.time()
+    check_valid_zone(zone, zoneinfo)
+    zoneinfo.check_date = datetime.now()
+
+    get_nameservers(zone, zoneinfo)
+    if not zoneinfo.nameservers:
+        raise ZoneInfoError, "%s: unable to find any nameservers" % zone
+
+    check_ip6_dns(zone, zoneinfo)
+    check_udp_dns(zone, zoneinfo)
+    check_tcp_dns(zone, zoneinfo)
+    check_dnskey(zone, zoneinfo)
+    if zoneinfo.has_dnssec:
+        check_nsec3param(zone, zoneinfo)
+        check_ds(zone, zoneinfo)
+    t2 = time.time()
+    zoneinfo.check_duration = (t2-t1)
+
+    return (zoneinfo)
+
+
+def parseopts(argv):
+    (options, arguments) = getopt.getopt(argv[1:], 'ds:')
+    print "options:", options
+    print "arguments", arguments
+
+
+def usage():
+    print """\
+Usage: zoneinfo.py [-d] zone"""
+    sys.exit(1)
+
+
+if __name__ == '__main__':
+
+    import getopt
+
+    try:
+        (options, args) = getopt.getopt(sys.argv[1:], 'd')
+    except getopt.GetoptError:
+        usage()
+    if len(args) != 1:
+        usage()
+
+    if "-d" in [x[0] for x in options]:
+        DEBUG=True
+    ZONE = args[0]
+    zi = get_zoneinfo(ZONE)
+    results(zi)
