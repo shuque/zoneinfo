@@ -223,6 +223,9 @@ def check_edns0(zone, zoneinfo):
             else:
                 if response.edns == 0:    # otherwise -1
                     zoneinfo.nsaddr_success_edns0 += 1
+                else:
+                    zoneinfo.dprint("Response from %s doesn't contain "
+                                    "EDNS0 OPT RR" % ip)
 
     zoneinfo.dprint("DNS/EDNS0 success: %d of %d servers" % 
                     (zoneinfo.nsaddr_success_edns0, zoneinfo.nsaddr_count_all))
