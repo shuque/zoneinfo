@@ -46,6 +46,7 @@ class ZoneInfo:
         self.nsaddr_count_ip6 = 0        # num of server IPv6 addresses
         self.nsaddr_success_ip4 = 0
         self.nsaddr_success_ip6 = 0
+        self.nsaddr_success_edns0 = 0
         self.has_ip6 = False
         self.has_tcp = False
         self.has_dnssec = False
@@ -53,6 +54,8 @@ class ZoneInfo:
         self.has_ds = False
         self.dnssec_alg_ksk = []         # list of (keytag, keyalg)
         self.dnssec_alg_zsk = []         # list of (keytag, keyalg)
+        self.ttl_dnskey = None           # TTL of DNSKEY RRset
+        self.rrsig_expiry = False        # Whether RRSIG expiry was detected
         self.nsec3param = []             # list of nsec3param tuples: 
                                          # (hashalg, flags, iter, saltlen)
         self.ds_digest_alg = []          # list of (keytag, dsalg)
@@ -79,8 +82,8 @@ def check_valid_zone(zone, zoneinfo):
         zoneinfo.dprint(errmsg)
         raise ZoneInfoError, errmsg
     except (dns.exception.Timeout):
-        errmsg = "%s: SOA query timed out. %s, %s" % \
-            ((zone,) + sys.exc_info()[0:2])
+        (exc_type, exc_val) = sys.exc_info()[0:2]
+        errmsg = "%s: SOA query timed out. %s, %s" % (zone, exc_type, exc_val)
         zoneinfo.dprint(errmsg)
         raise ZoneInfoError, errmsg
     else:
@@ -98,8 +101,8 @@ def get_nameservers(zone, zoneinfo):
         zoneinfo.dprint("%s: unamed to find any nameservers\n" % zone)
         return
     except (dns.exception.Timeout):
-        errmsg = "%s: NS query timed out. %s, %s" % \
-            ((zone,) + sys.exc_info()[0:2])
+        (exc_type, exc_val) = sys.exc_info()[0:2]
+        errmsg = "%s: NS query timed out. %s, %s" % (zone, exc_type, exc_val)
         zoneinfo.dprint(errmsg)
         return
 
@@ -161,7 +164,7 @@ def check_udp_dns(zone, zoneinfo):
             try:
                 response = dns.query.udp(msg, ip, timeout=TIMEOUT)
             except Exception:
-                (exc_type, exc_value, exc_traceback) = sys.exc_info()
+                (exc_type, exc_value) = sys.exc_info()[0:2]
                 zoneinfo.dprint("DNS/UDP failed: %s, %s (%s, %s)" % \
                                     (nsobj.name, ip, exc_type, exc_value))
             else:
@@ -188,7 +191,7 @@ def check_tcp_dns(zone, zoneinfo):
             try:
                 response = dns.query.tcp(msg, ip, timeout=TIMEOUT)
             except:
-                (exc_type, exc_value, exc_traceback) = sys.exc_info()
+                (exc_type, exc_value) = sys.exc_info()[0:2]
                 zoneinfo.dprint("DNS/TCP failed: %s, %s (%s, %s)" % \
                                     (nsobj.name, ip, exc_type, exc_value))
             else:
@@ -202,33 +205,77 @@ def check_tcp_dns(zone, zoneinfo):
     return
 
 
+def check_edns0(zone, zoneinfo):
+    """Check EDNS0 support on zone nameservers"""
+    for nsobj in zoneinfo.nameservers:
+        nshostname = nsobj.name
+        for ip in nsobj.ip4 + nsobj.ip6:
+            zoneinfo.dprint("Trying EDNS0 SOA query to %s, %s" % 
+                            (nshostname, ip))
+            msg = dns.message.make_query(zone, 'SOA', use_edns=0)
+            msg.flags ^= dns.flags.RD
+            try:
+                response = dns.query.udp(msg, ip, timeout=TIMEOUT)
+            except Exception:
+                (exc_type, exc_value) = sys.exc_info()[0:2]
+                zoneinfo.dprint("DNS/UDP failed: %s, %s (%s, %s)" % \
+                                    (nsobj.name, ip, exc_type, exc_value))
+            else:
+                if response.edns == 0:    # otherwise -1
+                    zoneinfo.nsaddr_success_edns0 += 1
+
+    zoneinfo.dprint("DNS/EDNS0 success: %d of %d servers" % 
+                    (zoneinfo.nsaddr_success_edns0, zoneinfo.nsaddr_count_all))
+    return
+
+
+def rrsigtime2string(rrsig_time):
+    """return human readable string representation of rrsig timestamp"""
+    return time.strftime("%Y-%m-%d-%H:%M", time.gmtime(rrsig_time))
+
+
 def check_dnskey(zone, zoneinfo):
     """Check any DNSKEY records in the zone"""
     r = dns.resolver.Resolver()
     r.lifetime = TIMEOUT
-    r.use_edns(edns=0, ednsflags=0, payload=4096)
+    r.use_edns(edns=0, ednsflags=dns.flags.DO, payload=4096)
     try:
         res = r.query(zone, 'DNSKEY')
     except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
             dns.resolver.NoNameservers):
         pass
     except (dns.exception.Timeout):
+        (exc_type, exc_val) = sys.exc_info()[0:2]
         errmsg = "%s: DNSKEY query timed out. %s, %s" % \
-            ((zone,) + sys.exc_info()[0:2])
+            (zone, exc_type, exc_val)
         zoneinfo.dprint(errmsg)
     else:
         zoneinfo.has_dnssec = True
+        zoneinfo.ttl_dnskey = res.rrset.ttl
         for dnskey_rdata in res.rrset.items:
             keytag = dns.dnssec.key_id(dnskey_rdata)
             dnssec_flags = dnskey_rdata.flags
             sepkey = dnssec_flags & 0x1;
             dnssec_alg = dnskey_rdata.algorithm
-            zoneinfo.dprint("DNSSEC key id=%d with flags=%d alg=%d ttl=%d" %
-                            (keytag, dnssec_flags, dnssec_alg, res.rrset.ttl))
+            zoneinfo.dprint("DNSSEC key id=%d with flags=%d alg=%d TTL=%d" %
+                            (keytag, dnssec_flags, dnssec_alg,
+                             zoneinfo.ttl_dnskey))
             if sepkey:
                 zoneinfo.dnssec_alg_ksk.append((keytag, dnssec_alg))
             else:
                 zoneinfo.dnssec_alg_zsk.append((keytag, dnssec_alg))
+
+        for rrset in res.response.answer:
+            if rrset.rdtype == 46:                # RRSIG type code
+                for rr in rrset.items:
+                    zoneinfo.dprint("RRSIG(DNSKEY %d) "
+                                    "inception=%s expiration=%s" % 
+                                    (rr.key_tag, 
+                                     rrsigtime2string(rr.inception), 
+                                     rrsigtime2string(rr.expiration)))
+                    if time.mktime(time.gmtime()) > rr.expiration:
+                        zoneinfo.rrsig_expiry = True
+                        zoneinfo.dprint("WARNING: signature has expired.")
     return
 
 
@@ -243,8 +290,9 @@ def check_nsec3param(zone, zoneinfo):
             dns.resolver.NoNameservers):
         pass
     except (dns.exception.Timeout):
+        (exc_type, exc_val) = sys.exc_info()[0:2]
         errmsg = "%s: NSEC3PARAM query timed out. %s, %s" % \
-            ((zone,) + sys.exc_info()[0:2])
+            (zone, exc_type, exc_val)
         zoneinfo.dprint(errmsg)
     else:
         zoneinfo.has_nsec3 = True
@@ -270,8 +318,9 @@ def check_ds(zone, zoneinfo):
             dns.resolver.NoNameservers):
         pass
     except (dns.exception.Timeout):
+        (exc_type, exc_val) = sys.exc_info()[0:2]
         errmsg = "%s: DS query timed out. %s, %s" % \
-            ((zone,) + sys.exc_info()[0:2])
+            (zone, exc_type, exc_val)
         zoneinfo.dprint(errmsg)
     else:
         zoneinfo.has_ds = True
@@ -299,6 +348,8 @@ def results(zoneinfo):
         (zoneinfo.nsaddr_success_ip4, zoneinfo.nsaddr_count_ip4)
     print "DNS/IPv6 response: %d of %d servers" % \
         (zoneinfo.nsaddr_success_ip6, zoneinfo.nsaddr_count_ip6)
+    print "DNS/EDNS0 response: %d of %d servers" % \
+        (zoneinfo.nsaddr_success_edns0, zoneinfo.nsaddr_count_all)
     if zoneinfo.has_tcp:
         print "All servers for zone respond to TCP DNS queries"
     else:
@@ -349,6 +400,7 @@ def get_zoneinfo(zone):
     check_ip6_dns(zone, zoneinfo)
     check_udp_dns(zone, zoneinfo)
     check_tcp_dns(zone, zoneinfo)
+    check_edns0(zone, zoneinfo)
     check_dnskey(zone, zoneinfo)
     if zoneinfo.has_dnssec:
         check_nsec3param(zone, zoneinfo)
