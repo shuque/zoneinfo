@@ -1,16 +1,17 @@
 Program:	zoneinfo: A DNS zone information query tool
-Version:	0.1
+Version:	0.2
 Author:		Shumon Huque <shuque@upenn.edu>
 
 zoneinfo: A program to query a DNS zone and print out some 
 information about. Currently the information includes the 
 number of nameserver records and nameserver addresses, whether
 or not the nameservers respond to TCP queries, whether or not
-IPv6 is enabled, DNSSEC deployment status and statistics (keytags,
-algorithms, NSEC3 parameters, DS record information etc). Passing
-the option "-d" will print additional debugging information. This
-code is part of a larger program of mine that collects and displays
-information for a large set of zones in a web application.
+IPv6 is enabled, whether or not EDNS0 is supported, DNSSEC deployment 
+status and statistics (keytags, algorithms, NSEC3 parameters, DS 
+record information etc). Passing the option "-d" will print additional 
+debugging information. This code is part of a larger program of mine 
+that collects and displays information for a large set of zones in a 
+web application.
 
 Pre-requisites:
 
@@ -33,13 +34,14 @@ Example runs:
 
 $ zoneinfo berkeley.edu
 DNS Zone: berkeley.edu
-Elapsed time for zone check: 2.95 sec
+Elapsed time for zone check: 3.87 sec
 5 Nameserver records
 10 Nameserver addresses (IPv4=5, IPv6=5)
 DNS/UDP response: 10 of 10 servers
 DNS/TCP response: 10 of 10 servers
 DNS/IPv4 response: 5 of 5 servers
 DNS/IPv6 response: 5 of 5 servers
+DNS/EDNS0 response: 10 of 10 servers
 All servers for zone respond to TCP DNS queries
 Zone advertises IPv6 enabled DNS servers
 Zone has DNSSEC enabled
@@ -57,6 +59,7 @@ DNS/UDP response: 4 of 4 servers
 DNS/TCP response: 4 of 4 servers
 DNS/IPv4 response: 4 of 4 servers
 DNS/IPv6 response: 0 of 0 servers
+DNS/EDNS0 response: 0 of 4 servers
 All servers for zone respond to TCP DNS queries
 Zone does not advertise IPv6 enabled DNS servers
 Zone does not have DNSSEC enabled
