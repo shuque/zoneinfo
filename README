@@ -1,5 +1,5 @@
 Program:	zoneinfo: A DNS zone information query tool
-Version:	0.2
+Version:	0.3
 Author:		Shumon Huque <shuque@upenn.edu>
 
 zoneinfo: A program to query a DNS zone and print out some 
