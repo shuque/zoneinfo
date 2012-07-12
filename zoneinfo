@@ -176,7 +176,8 @@ def check_udp_dns(zone, zoneinfo):
             msg = dns.message.make_query(zoneinfo.abs_zone, 'SOA')
             msg.flags ^= dns.flags.RD
             try:
-                response = dns.query.udp(msg, ip, timeout=TIMEOUT)
+                response = dns.query.udp(msg, ip, timeout=TIMEOUT, 
+                                         ignore_unexpected=True)
             except:
                 (exc_type, exc_val) = sys.exc_info()[0:2]
                 zoneinfo.dprint("DNS/UDP failed: %s, %s (%s, %s)" % \
@@ -229,7 +230,8 @@ def check_edns0(zone, zoneinfo):
             msg = dns.message.make_query(zoneinfo.abs_zone, 'SOA', use_edns=0)
             msg.flags ^= dns.flags.RD
             try:
-                response = dns.query.udp(msg, ip, timeout=TIMEOUT)
+                response = dns.query.udp(msg, ip, timeout=TIMEOUT,
+                                         ignore_unexpected=True)
             except Exception:
                 (exc_type, exc_value) = sys.exc_info()[0:2]
                 zoneinfo.dprint("DNS/UDP failed: %s, %s (%s, %s)" %
